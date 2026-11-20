@@ -271,7 +271,22 @@ function depthLimitedCommits(repo: Repo, wants: string[], depth: number): Map<st
  * Returns the objects plus the shallow-info lines for the response.
  */
 function fetchObjects(repo: Repo, wants: string[], haves: string[], depth: number, inputShallow: string[]): { objects: Map<string, GitObj>; shallow: string[]; unshallow: string[] } {
-  const haveClosure = reachableObjects(repo, haves);
+  // What the client already holds. A shallow have means "I hold this commit
+  // and its tree, but NOT its parents" — the client says so with the `shallow`
+  // lines. Treating such a have as full history would exclude the very parent
+  // a deepen must deliver (its ancestors are not held at all).
+  const shallowSet = new Set(inputShallow);
+  const haveClosure = new Map<string, GitObj>();
+  for (const [k, v] of reachableObjects(repo, haves.filter((h) => !shallowSet.has(h)))) haveClosure.set(k, v);
+  for (const h of haves.filter((x) => shallowSet.has(x))) {
+    const obj = repo.objects.get(h);
+    if (!obj) continue;
+    haveClosure.set(h, obj);
+    if (obj.type === 'commit') {
+      const tree = parseCommit(obj.data).tree;
+      for (const [k, v] of reachableObjects(repo, [tree])) haveClosure.set(k, v);
+    }
+  }
   const objects = new Map<string, GitObj>();
   const shallow: string[] = [];
   const unshallow: string[] = [];
@@ -1164,12 +1179,14 @@ function v2Advertisement(): Buffer {
   ]);
 }
 
-/** Side-band-64k framing: channel 1 = pack data. */
+/** Side-band-64k framing: channel 1 = pack data. A pkt-line is at most 65520
+ *  bytes total (65516 payload), and the band byte counts — so at most 65515
+ *  data bytes per packet; 65516 overflows the client's pkt-line limit. */
 function sideband(data: Buffer): Buffer {
   const out: Buffer[] = [];
   let off = 0;
   while (off < data.length) {
-    const chunk = data.subarray(off, Math.min(data.length, off + 65516));
+    const chunk = data.subarray(off, Math.min(data.length, off + 65515));
     const payload = Buffer.concat([Buffer.from([1]), chunk]);
     out.push(pkt(payload));
     off += chunk.length;
@@ -1588,9 +1605,8 @@ function validateFields(fields: GqlField[], parentType: string, errors: string[]
     else if (f.name === 'pullRequests') child = 'PullRequestConnection';
     else if (f.name === 'nodes') child = parentType === 'IssueConnection' ? 'Issue' : parentType === 'PullRequestConnection' ? 'PullRequest' : parentType === 'LabelConnection' ? 'Label' : parentType === 'CommentConnection' ? 'IssueComment' : parentType === 'FileConnection' ? 'PullRequestFile' : parentType;
     else if (f.name === 'edges') child = parentType === 'IssueConnection' ? 'IssueEdge' : parentType === 'PullRequestConnection' ? 'PullRequestEdge' : parentType === 'LabelConnection' ? 'LabelEdge' : parentType === 'CommentConnection' ? 'CommentEdge' : parentType === 'FileConnection' ? 'FileEdge' : parentType;
-    else if (f.name === 'node') child = parentType === 'IssueEdge' ? 'Issue' : parentType === 'PullRequestEdge' ? 'PullRequest' : parentType === 'LabelEdge' ? 'Label' : parentType === 'CommentEdge' ? 'IssueComment' : parentType === 'FileEdge' ? 'PullRequestFile' : parentType;
+    else if (f.name === 'node') child = parentType === 'Query' ? undefined : parentType === 'IssueEdge' ? 'Issue' : parentType === 'PullRequestEdge' ? 'PullRequest' : parentType === 'LabelEdge' ? 'Label' : parentType === 'CommentEdge' ? 'IssueComment' : parentType === 'FileEdge' ? 'PullRequestFile' : parentType;
     else if (f.name === 'viewer') child = 'User';
-    else if (f.name === 'node') { /* Node resolves per concrete type; skip child validation */ }
     else if (f.name === 'owner') child = 'User';
     else if (f.name === 'author' || f.name === 'assignees') child = 'User';
     else if (f.name === 'labels') child = 'LabelConnection';
