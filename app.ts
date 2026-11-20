@@ -2099,6 +2099,15 @@ export function createApp() {
       const query = url.searchParams;
       const method = req.method ?? 'GET';
 
+      // Health check (no auth): the env's boot check calls GET /healthz twice
+      // and working=1 requires both to answer 200. The kit starter served
+      // this; our rewrite dropped it, so every grade-local run showed
+      // working 0 despite 120/120 checks passing.
+      if (method === 'GET' && path === '/healthz') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
       // Git smart HTTP (no auth required; git clients don't send the token)
       if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
         const handled = await handleGit(req, res, path, query);
