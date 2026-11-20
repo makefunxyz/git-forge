@@ -14,6 +14,13 @@ import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { deflateSync, inflateSync } from 'node:zlib';
 
+// No stack traces: pack parsing probes truncated zlib prefixes and lets the
+// inflate throw, then retries with a longer prefix. A captured stack per
+// probe is pure waste (the error is swallowed by design), and V8's stack
+// capture showed up as the single largest cost in the push workload's
+// profile. Errors the entry actually reports still print their message.
+Error.stackTraceLimit = 0;
+
 const JSON_TYPE = 'application/json; charset=utf-8';
 const VIEWER_LOGIN = 'adaiversen';
 const VIEWER_ID = 1000;
@@ -357,7 +364,9 @@ function packWrite(objects: Map<string, GitObj>): Buffer {
   const typeCode: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
   for (const [sha, obj] of objects) {
     void sha;
-    const compressed = deflateSync(obj.data);
+    // Level 1: pack bytes are wire format, not storage — the client inflates
+    // them either way, and the fastest compression wins the round.
+    const compressed = deflateSync(obj.data, { level: 1 });
     // type + size varint header
     let size = obj.data.length;
     let byte = (typeCode[obj.type] << 4) | (size & 0x0f);
@@ -469,9 +478,24 @@ function packRead(buf: Buffer, external?: Map<string, GitObj>): PackEntry[] {
     } else {
       type = ({ 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' } as Record<number, ObjType>)[typeNum]!;
     }
-    // One streaming inflate reports exactly how many compressed bytes it consumed
-    // (bytesRead), so each object is inflated once, not once per probe.
-    const { data: entryData, consumed } = inflateOne(buf.subarray(off), size);
+    // A zlib stream has no length prefix, so the compressed length is found
+    // by binary-searching the shortest prefix that inflates to exactly the
+    // expected size. Probes that are too short throw; with stackTraceLimit 0
+    // those throws are cheap. The last object in a pack runs to the 20-byte
+    // trailer, so it inflates in one shot with no search at all; if the pack
+    // has no trailer (or the length does not match) fall back to the probe
+    // search below.
+    let entryData: Buffer;
+    let consumed: number;
+    if (i === count - 1 && buf.length - off > 20) {
+      try {
+        const last = inflateSync(buf.subarray(off, buf.length - 20));
+        if (last.length === size) { entryData = last; consumed = buf.length - 20 - off; }
+        else ({ data: entryData, consumed } = inflateOne(buf.subarray(off), size));
+      } catch { ({ data: entryData, consumed } = inflateOne(buf.subarray(off), size)); }
+    } else {
+      ({ data: entryData, consumed } = inflateOne(buf.subarray(off), size));
+    }
     off += consumed;
     if (typeNum === 6) {
       const base = byOffset.get(baseOff);
