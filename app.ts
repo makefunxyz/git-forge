@@ -234,7 +234,80 @@ function isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
   return false;
 }
 
-/** All objects reachable from a set of tips (commits, their trees, blobs, tags). */
+/** The commit a tag object points at, or null. */
+function tagTarget(repo: Repo, sha: string): string | null {
+  const obj = repo.objects.get(sha);
+  if (!obj || obj.type !== 'tag') return null;
+  return obj.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1] ?? null;
+}
+
+/** Commits at BFS distance 0..depth-1 from `wants`, with their distances. */
+function depthLimitedCommits(repo: Repo, wants: string[], depth: number): Map<string, number> {
+  const dist = new Map<string, number>();
+  const queue: string[] = [];
+  for (const w of wants) {
+    const obj = repo.objects.get(w);
+    if (!obj || obj.type !== 'commit' || dist.has(w)) continue;
+    dist.set(w, 0);
+    queue.push(w);
+  }
+  while (queue.length > 0) {
+    const sha = queue.shift()!;
+    const d = dist.get(sha)!;
+    if (d >= depth - 1) continue;
+    const obj = repo.objects.get(sha);
+    if (!obj || obj.type !== 'commit') continue;
+    for (const p of parseCommit(obj.data).parents) {
+      if (!dist.has(p)) { dist.set(p, d + 1); queue.push(p); }
+    }
+  }
+  return dist;
+}
+
+/**
+ * Objects for a fetch: the closure of `wants` (or, with `depth`, only commits
+ * 0..depth-1 from the wants) minus the FULL closure of `haves` — every object
+ * the client already holds, trees and blobs included, never re-sent.
+ * Returns the objects plus the shallow-info lines for the response.
+ */
+function fetchObjects(repo: Repo, wants: string[], haves: string[], depth: number, inputShallow: string[]): { objects: Map<string, GitObj>; shallow: string[]; unshallow: string[] } {
+  const haveClosure = reachableObjects(repo, haves);
+  const objects = new Map<string, GitObj>();
+  const shallow: string[] = [];
+  const unshallow: string[] = [];
+  if (depth > 0) {
+    const dist = depthLimitedCommits(repo, wants, depth);
+    for (const c of dist.keys()) {
+      const obj = repo.objects.get(c);
+      if (!obj) continue;
+      if (!haveClosure.has(c)) objects.set(c, obj);
+      if (obj.type === 'commit') {
+        // The commit's tree closure only — never its parents (they are beyond the depth).
+        const tree = parseCommit(obj.data).tree;
+        for (const [k, v] of reachableObjects(repo, [tree])) if (!haveClosure.has(k)) objects.set(k, v);
+      }
+    }
+    // New boundary: commits at exactly depth-1 that still have parents.
+    for (const [sha, d] of dist) {
+      if (d !== depth - 1) continue;
+      const obj = repo.objects.get(sha);
+      if (!obj || obj.type !== 'commit') continue;
+      if (parseCommit(obj.data).parents.length > 0) shallow.push(sha);
+    }
+    // Previously-shallow commits whose parents are now delivered are unshallow.
+    for (const s of inputShallow) {
+      const obj = repo.objects.get(s);
+      if (!obj || obj.type !== 'commit') continue;
+      if (parseCommit(obj.data).parents.every((p) => dist.has(p))) unshallow.push(s);
+    }
+  } else {
+    const all = reachableObjects(repo, wants);
+    for (const [k, v] of all) if (!haveClosure.has(k)) objects.set(k, v);
+    // No deepen: the client's shallow boundaries stay shallow.
+    for (const s of inputShallow) if (!shallow.includes(s)) shallow.push(s);
+  }
+  return { objects, shallow, unshallow };
+}
 function reachableObjects(repo: Repo, tips: string[]): Map<string, GitObj> {
   const out = new Map<string, GitObj>();
   const queue: string[] = [...tips];
@@ -1158,21 +1231,22 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
     const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice(11));
     const refs = refList(repo);
     const headSha = repo.refs.get('refs/heads/main');
+    // A ref-prefix filters every line, HEAD included: a caller asking for
+    // refs/tags/ must not see HEAD (the client counts any non-matching name).
+    const showHead = prefixes.length === 0 || prefixes.some((q) => 'HEAD'.startsWith(q));
     if (refs.length === 0 && unborn) {
-      out.push(pkt(`${ZERO_OID} HEAD\0unborn\n`));
-      out.push(pkt(`${ZERO_OID} refs/heads/main\0unborn\n`));
+      // The kit client parses unborn as a leading token: "unborn HEAD ...".
+      // No refs/heads/main line: the client counts any refs/* name as a real ref.
+      out.push(pkt('unborn HEAD symref-target:refs/heads/main\n'));
     } else {
-      if (symrefs && headSha) out.push(pkt(`${headSha} HEAD symref-target:refs/heads/main\n`));
+      if (symrefs && headSha && showHead) out.push(pkt(`${headSha} HEAD symref-target:refs/heads/main\n`));
       for (const { ref, sha } of refs) {
-        if (prefixes.length > 0 && !prefixes.some((p) => ref.startsWith(p))) continue;
-        out.push(pkt(`${sha} ${ref}\n`));
-        if (peel) {
-          const obj = repo.objects.get(sha);
-          if (obj && obj.type === 'tag') {
-            const target = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1];
-            if (target) out.push(pkt(`${target} ${ref}^{}\n`));
-          }
-        }
+        if (prefixes.length > 0 && !prefixes.some((q) => ref.startsWith(q))) continue;
+        const target = peel ? tagTarget(repo, sha) : null;
+        // The kit client reads peel from the "peeled:" attribute; real git
+        // reads the ^{} line. Emit both so each client sees the peel.
+        out.push(pkt(target ? `${sha} ${ref} peeled:${target}\n` : `${sha} ${ref}\n`));
+        if (target) out.push(pkt(`${target} ${ref}^{}\n`));
       }
     }
     out.push(PKT_FLUSH);
@@ -1182,52 +1256,29 @@ function handleUploadPackV2(repo: Repo, body: Buffer, res: ServerResponse): void
   if (command === 'fetch') {
     const wants: string[] = [];
     const haves: string[] = [];
+    const inputShallow: string[] = [];
     let deepen = 0;
     for (const a of args) {
       if (a.startsWith('want ')) wants.push(a.slice(5).trim());
       else if (a.startsWith('have ')) haves.push(a.slice(5).trim());
+      else if (a.startsWith('shallow ')) inputShallow.push(a.slice(8).trim());
       else if (a.startsWith('deepen ')) deepen = Number(a.slice(7).trim()) || 0;
     }
-    const shallow = deepen > 0;
     // Real git's v2 fetch answer (verified against git 2.43 upload-pack):
     // no ready/ACK/wanted-refs sections in the one-round case — the server
-    // answers the packfile directly. Shallow first: "shallow-info", one
-    // "shallow <sha>" line per wanted tip, then a delim; then "packfile",
-    // the sideband pack, and a flush. The transport adds the response-end.
+    // answers the packfile directly. Shallow first: "shallow-info" with the
+    // computed boundary (and unshallow lines for deepened commits), then a
+    // delim; then "packfile", the sideband pack, and a flush. The transport
+    // adds the response-end.
+    const { objects, shallow, unshallow } = fetchObjects(repo, wants, haves, deepen, inputShallow);
     const out: Buffer[] = [];
-    if (shallow) {
+    if (shallow.length > 0 || unshallow.length > 0) {
       out.push(pkt('shallow-info\n'));
-      for (const w of wants) out.push(pkt(`shallow ${w}\n`));
+      for (const s of shallow) out.push(pkt(`shallow ${s}\n`));
+      for (const s of unshallow) out.push(pkt(`unshallow ${s}\n`));
       out.push(PKT_DELIM);
     }
     out.push(pkt('packfile\n'));
-    // packfile section
-    let objects: Map<string, GitObj>;
-    if (shallow) {
-      objects = new Map();
-      for (const w of wants) {
-        const obj = repo.objects.get(w);
-        if (!obj) continue;
-        objects.set(w, obj);
-        if (obj.type === 'commit') {
-          const tree = parseCommit(obj.data).tree;
-          const rest = reachableObjects(repo, [tree]);
-          for (const [k, v] of rest) objects.set(k, v);
-        }
-      }
-    } else {
-      const haveSet = new Set<string>();
-      for (const h of haves) for (const c of walkCommits(repo, h)) haveSet.add(c);
-      objects = reachableObjects(repo, wants);
-      if (haveSet.size > 0) {
-        // Never resend commits the client already has; trees/blobs stay, since
-        // a new commit may reference a tree the client has never seen.
-        for (const k of [...objects.keys()]) {
-          const o = objects.get(k)!;
-          if (o.type === 'commit' && haveSet.has(k)) objects.delete(k);
-        }
-      }
-    }
     const pack = packWrite(objects);
     out.push(sideband(pack));
     out.push(PKT_FLUSH);
@@ -1243,37 +1294,19 @@ function handleUploadPackV0(repo: Repo, body: Buffer, res: ServerResponse): void
   const lines = packets.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8').trim());
   const wants: string[] = [];
   const haves: string[] = [];
+  const inputShallow: string[] = [];
   let deepen = 0;
   for (const line of lines) {
     if (line.startsWith('want ')) wants.push(line.slice(5).split(' ')[0]);
     else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) inputShallow.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) deepen = Number(line.slice(7).trim()) || 0;
     else if (line === 'done') break;
   }
+  const { objects, shallow, unshallow } = fetchObjects(repo, wants, haves, deepen, inputShallow);
   const out: Buffer[] = [pkt('NAK\n')];
-  let objects: Map<string, GitObj>;
-  if (deepen > 0) {
-    objects = new Map();
-    for (const w of wants) {
-      const obj = repo.objects.get(w);
-      if (!obj) continue;
-      objects.set(w, obj);
-      if (obj.type === 'commit') {
-        const rest = reachableObjects(repo, [parseCommit(obj.data).tree]);
-        for (const [k, v] of rest) objects.set(k, v);
-      }
-    }
-  } else {
-    objects = reachableObjects(repo, wants);
-    const haveSet = new Set<string>();
-    for (const h of haves) for (const c of walkCommits(repo, h)) haveSet.add(c);
-    if (haveSet.size > 0) {
-      for (const k of [...objects.keys()]) {
-        const o = objects.get(k)!;
-        if (o.type === 'commit' && haveSet.has(k)) objects.delete(k);
-      }
-    }
-  }
+  for (const s of shallow) out.push(pkt(`shallow ${s}\n`));
+  for (const s of unshallow) out.push(pkt(`unshallow ${s}\n`));
   out.push(sideband(packWrite(objects)));
   // The sideband demultiplexer reads until a flush packet; without it git
   // reports "unexpected disconnect while reading sideband packet".
@@ -1321,7 +1354,9 @@ function handleReceivePack(repo: Repo, body: Buffer, res: ServerResponse): void 
   };
   const results: { ref: string; ok: boolean; reason?: string }[] = [];
   try {
-    const entries = packRead(packBuf, repo.objects);
+    // A delete-only command list carries no pack at all (git sends none there
+    // either); an empty pack section is zero objects, not an unpack failure.
+    const entries = packBuf.length === 0 ? [] : packRead(packBuf, repo.objects);
     for (const e of entries) if (!repo.objects.has(e.sha)) repo.objects.set(e.sha, { type: e.type, data: e.data });
   } catch {
     // A pack that fails to parse leaves every ref refused.
