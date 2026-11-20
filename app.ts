@@ -177,7 +177,7 @@ interface CommitView { tree: string; parents: string[]; message: string; author:
 function parseCommit(data: Buffer): CommitView {
   const text = data.toString('utf8');
   const [head, ...rest] = text.split('\n\n');
-  const message = rest.join('\n\n');
+  const message = rest.join('\n\n').replace(/\n+$/, '');
   const parents: string[] = [];
   let tree = '';
   let author = '';
@@ -1089,20 +1089,23 @@ function createPull(repo: Repo, head: string, base: string, title: string, body:
 
 /** A pull is conflicted when head and base both changed the same file differently since the merge base. */
 function pullConflict(repo: Repo, pull: Pull): boolean {
+  // The base tip is the branch's CURRENT tip: another PR may have merged since
+  // this one opened, and the conflict is against what is on the base now.
+  const baseTipSha = repo.refs.get(`refs/heads/${pull.base}`) ?? pull.baseSha;
   const headCommits = walkCommits(repo, pull.headSha);
-  const baseCommits = new Set(walkCommits(repo, pull.baseSha));
+  const baseCommits = new Set(walkCommits(repo, baseTipSha));
   const mergeBase = headCommits.find((c) => baseCommits.has(c));
   if (!mergeBase) return false;
   const baseTree = parseCommit(repo.objects.get(mergeBase)!.data).tree;
   const headTree = parseCommit(repo.objects.get(pull.headSha)!.data).tree;
-  const baseTipTree = parseCommit(repo.objects.get(pull.baseSha)!.data).tree;
+  const baseTipTree = parseCommit(repo.objects.get(baseTipSha)!.data).tree;
   const headDiff = new Map(diffTrees(repo, baseTree, headTree).map((d) => [d.filename, d]));
   const baseDiff = new Map(diffTrees(repo, baseTree, baseTipTree).map((d) => [d.filename, d]));
   for (const [path, hd] of headDiff) {
     const bd = baseDiff.get(path);
     if (!bd) continue;
     const headFile = readPath(repo, pull.headSha, path);
-    const baseFile = readPath(repo, pull.baseSha, path);
+    const baseFile = readPath(repo, baseTipSha, path);
     if ((headFile?.blobSha ?? '') !== (baseFile?.blobSha ?? '')) return true;
     void hd;
   }
@@ -1514,7 +1517,9 @@ function gqlParse(source: string): { fields: GqlField[]; opType: 'query' | 'muta
         i += 3;
         const name = readName();
         if (name === 'on') readName();
-        parseSelection();
+        // Inline fragment ("... on Repository { ... }"): its fields belong to
+        // the enclosing selection — merge them in, don't drop them.
+        fields.push(...parseSelection());
         continue;
       }
       const first = readName();
@@ -1584,6 +1589,8 @@ function validateFields(fields: GqlField[], parentType: string, errors: string[]
     else if (f.name === 'nodes') child = parentType === 'IssueConnection' ? 'Issue' : parentType === 'PullRequestConnection' ? 'PullRequest' : parentType === 'LabelConnection' ? 'Label' : parentType === 'CommentConnection' ? 'IssueComment' : parentType === 'FileConnection' ? 'PullRequestFile' : parentType;
     else if (f.name === 'edges') child = parentType === 'IssueConnection' ? 'IssueEdge' : parentType === 'PullRequestConnection' ? 'PullRequestEdge' : parentType === 'LabelConnection' ? 'LabelEdge' : parentType === 'CommentConnection' ? 'CommentEdge' : parentType === 'FileConnection' ? 'FileEdge' : parentType;
     else if (f.name === 'node') child = parentType === 'IssueEdge' ? 'Issue' : parentType === 'PullRequestEdge' ? 'PullRequest' : parentType === 'LabelEdge' ? 'Label' : parentType === 'CommentEdge' ? 'IssueComment' : parentType === 'FileEdge' ? 'PullRequestFile' : parentType;
+    else if (f.name === 'viewer') child = 'User';
+    else if (f.name === 'node') { /* Node resolves per concrete type; skip child validation */ }
     else if (f.name === 'owner') child = 'User';
     else if (f.name === 'author' || f.name === 'assignees') child = 'User';
     else if (f.name === 'labels') child = 'LabelConnection';
@@ -1614,7 +1621,7 @@ function issueNode(repo: Repo, issue: Issue): Record<string, GqlValue> {
     id: gid('Issue', repo.id, issue.number),
     number: issue.number,
     title: issue.title,
-    state: issue.state,
+    state: issue.state === 'open' ? 'OPEN' : 'CLOSED',
     body: issue.body ?? null,
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
@@ -1667,26 +1674,42 @@ function repoNode(repo: Repo): Record<string, GqlValue> {
   };
 }
 
+const gqlCursor = (n: number): string => Buffer.from(`cursor:${n}`).toString('base64');
+function gqlAfter(args: Record<string, GqlValue>, list: { number: number }[]): number {
+  const after = typeof args.after === 'string' ? args.after : null;
+  if (!after) return 0;
+  try {
+    const m = Buffer.from(after, 'base64').toString('utf8').match(/^cursor:(\d+)$/);
+    if (!m) return 0;
+    const idx = list.findIndex((i) => i.number === Number(m[1]));
+    return idx >= 0 ? idx + 1 : 0;
+  } catch { return 0; }
+}
+
 function issuesConnection(repo: Repo, args: Record<string, GqlValue>): Record<string, GqlValue> {
   let list = [...repo.issues].sort((a, b) => b.number - a.number);
   const states = args.states as string[] | undefined;
-  if (Array.isArray(states) && states.length > 0) list = list.filter((i) => states.includes(i.state));
+  if (Array.isArray(states) && states.length > 0) list = list.filter((i) => states.includes(i.state === 'open' ? 'OPEN' : 'CLOSED'));
   if (args.orderBy && typeof args.orderBy === 'object') {
     const ob = args.orderBy as Record<string, GqlValue>;
     if (ob.field === 'CREATED_AT') list = [...list].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.number - a.number);
   }
+  const start = gqlAfter(args, list);
   const first = typeof args.first === 'number' ? args.first : undefined;
-  const nodes = (first !== undefined ? list.slice(0, first) : list).map((i) => issueNode(repo, i));
-  return { nodes, edges: nodes.map((n, idx) => ({ node: n, cursor: String(idx) })), totalCount: list.length, pageInfo: { hasNextPage: first !== undefined && list.length > first, hasPreviousPage: false, startCursor: nodes.length ? '0' : null, endCursor: nodes.length ? String(nodes.length - 1) : null } };
+  const page = first !== undefined ? list.slice(start, start + first) : list.slice(start);
+  const nodes = page.map((i) => issueNode(repo, i));
+  return { nodes, edges: page.map((i) => ({ node: issueNode(repo, i), cursor: gqlCursor(i.number) })), totalCount: list.length, pageInfo: { hasNextPage: first !== undefined && start + page.length < list.length, hasPreviousPage: start > 0, startCursor: page.length ? gqlCursor(page[0].number) : null, endCursor: page.length ? gqlCursor(page[page.length - 1].number) : null } };
 }
 
 function pullsConnection(repo: Repo, args: Record<string, GqlValue>): Record<string, GqlValue> {
   let list = [...repo.pulls].sort((a, b) => b.number - a.number);
   const states = args.states as string[] | undefined;
   if (Array.isArray(states) && states.length > 0) list = list.filter((p) => states.includes(p.merged ? 'MERGED' : p.state === 'open' ? 'OPEN' : 'CLOSED'));
+  const start = gqlAfter(args, list);
   const first = typeof args.first === 'number' ? args.first : undefined;
-  const nodes = (first !== undefined ? list.slice(0, first) : list).map((p) => pullNode(repo, p));
-  return { nodes, edges: nodes.map((n, idx) => ({ node: n, cursor: String(idx) })), totalCount: list.length, pageInfo: { hasNextPage: first !== undefined && list.length > first, hasPreviousPage: false, startCursor: nodes.length ? '0' : null, endCursor: nodes.length ? String(nodes.length - 1) : null } };
+  const page = first !== undefined ? list.slice(start, start + first) : list.slice(start);
+  const nodes = page.map((p) => pullNode(repo, p));
+  return { nodes, edges: page.map((p) => ({ node: pullNode(repo, p), cursor: gqlCursor(p.number) })), totalCount: list.length, pageInfo: { hasNextPage: first !== undefined && start + page.length < list.length, hasPreviousPage: start > 0, startCursor: page.length ? gqlCursor(page[0].number) : null, endCursor: page.length ? gqlCursor(page[page.length - 1].number) : null } };
 }
 
 function resolveRepoField(repo: Repo, field: GqlField, errors: string[]): Record<string, GqlValue> | null {
@@ -1929,7 +1952,7 @@ async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise
 
 const MCP_TOOLS = [
   { name: 'create_repo', description: 'Create a new repository for the authenticated user.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, private: { type: 'boolean' } }, required: ['name'] } },
-  { name: 'get_repo', description: 'Get a repository by owner and name.', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, name: { type: 'string' } }, required: ['owner', 'name'] } },
+  { name: 'get_repo', description: 'Get a repository by owner and name.', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' } }, required: ['owner', 'repo'] } },
   { name: 'create_issue', description: 'Create an issue in a repository.', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, labels: { type: 'array', items: { type: 'string' } } }, required: ['owner', 'repo', 'title'] } },
   { name: 'list_issues', description: 'List issues in a repository.', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } }, required: ['owner', 'repo'] } },
   { name: 'create_pull_request', description: 'Create a pull request in a repository.', inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, head: { type: 'string' }, base: { type: 'string' } }, required: ['owner', 'repo', 'title', 'head', 'base'] } },
@@ -1951,7 +1974,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { content: { 
     return { content: [{ type: 'text', text: JSON.stringify(repoView(repo)) }] };
   }
   if (base === 'get_repo') {
-    const repo = getRepo(a('owner'), a('name'));
+    const repo = getRepo(a('owner'), a('repo') || a('name'));
     if (!repo) return { content: [{ type: 'text', text: JSON.stringify({ message: 'Not Found' }) }], isError: true };
     return { content: [{ type: 'text', text: JSON.stringify(repoView(repo)) }] };
   }
